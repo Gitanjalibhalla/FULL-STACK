@@ -1,0 +1,217 @@
+/*
+E-commerce Catalog with Nested Document Structure in MongoDB
+Single-file demo using Mongoose (Node.js).
+
+Features:
+- Nested categories (tree stored as embedded children + materialized path)
+- Products with embedded variants, attributes, images, inventory, reviews
+- Example inserts, updates, and queries + aggregation examples
+- Index recommendations
+
+Run:
+1) npm init -y
+2) npm install mongoose
+3) Set MONGODB_URI in environment or replace the default below
+4) node ecommerce_mongo_nested.js
+
+NOTE: This file is an educational example. For production consider splitting models, validation, error handling, and not embedding extremely large arrays.
+*/
+
+const mongoose = require('mongoose');
+const { Schema } = mongoose;
+
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/ecommerce_demo';
+
+// ---------- Subdocuments ----------
+const ImageSchema = new Schema({
+  url: { type: String, required: true },
+  alt: String,
+  order: { type: Number, default: 0 }
+}, { _id: false });
+
+const AttributeSchema = new Schema({
+  key: { type: String, required: true },
+  value: { type: String, required: true }
+}, { _id: false });
+
+const InventorySchema = new Schema({
+  quantity: { type: Number, required: true, default: 0 },
+  warehouseLocation: String
+}, { _id: false });
+
+const VariantSchema = new Schema({
+  sku: { type: String, required: true },
+  title: String,
+  price: { type: Number, required: true },
+  compareAtPrice: Number,
+  attributes: [AttributeSchema], // e.g. size/color
+  images: [ImageSchema],
+  inventory: InventorySchema,
+  active: { type: Boolean, default: true }
+}, { _id: true }); // keep _id for each variant to reference
+
+const ReviewSchema = new Schema({
+  userId: Schema.Types.ObjectId,
+  rating: { type: Number, min: 1, max: 5 },
+  title: String,
+  body: String,
+  createdAt: { type: Date, default: Date.now }
+}, { _id: true });
+
+// ---------- Category (nested) ----------
+// We'll store a nested tree for quick navigation AND store a materializedPath for efficient queries
+const CategorySchema = new Schema({
+  name: { type: String, required: true },
+  slug: { type: String, required: true, lowercase: true },
+  description: String,
+  children: [ /* recursive */ ],
+  // materialized path: e.g. "/electronics/phones/smartphones"
+  path: { type: String, index: true }
+}, { _id: true });
+// Attach self-reference after declaration to allow recursion
+CategorySchema.add({ children: [CategorySchema] });
+
+// ---------- Product (with nested variants) ----------
+const ProductSchema = new Schema({
+  title: { type: String, required: true },
+  slug: { type: String, required: true, lowercase: true, index: true },
+  description: String,
+  shortDescription: String,
+  categories: [{ // store both embedded minimal category info AND keep category ids optional
+    _id: { type: Schema.Types.ObjectId, ref: 'Category' },
+    name: String,
+    slug: String
+  }],
+  // Primary product images
+  images: [ImageSchema],
+  // Price at product level (can be overridden by variants)
+  price: Number,
+  // Embedded variants for fast reads; suitable when per-product variants count is moderate
+  variants: [VariantSchema],
+  // Product-level attributes (e.g., brand)
+  attributes: [AttributeSchema],
+  // Reviews as embedded docs (could also be separate collection for scale)
+  reviews: [ReviewSchema],
+  active: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+ProductSchema.index({ title: 'text', description: 'text', 'attributes.value': 'text' });
+ProductSchema.pre('save', function(next){ this.updatedAt = Date.now(); next(); });
+
+// ---------- Models ----------
+const Category = mongoose.model('Category', CategorySchema);
+const Product = mongoose.model('Product', ProductSchema);
+
+// ---------- Demo flow ----------
+async function main(){
+  await mongoose.connect(MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true });
+  console.log('Connected to', MONGODB_URI);
+
+  // Clear demo data
+  await Category.deleteMany({});
+  await Product.deleteMany({});
+
+  // Create nested categories (electronics > phones > smartphones)
+  const smartphonesCat = new Category({ name: 'Smartphones', slug: 'smartphones', description: 'Smartphones and mobiles', path: '/electronics/phones/smartphones' });
+  const phonesCat = new Category({ name: 'Phones', slug: 'phones', description: 'All phones', path: '/electronics/phones', children: [smartphonesCat] });
+  const electronicsCat = new Category({ name: 'Electronics', slug: 'electronics', description: 'Electronic devices', path: '/electronics', children: [phonesCat] });
+
+  await electronicsCat.save();
+  console.log('Saved nested categories');
+
+  // Create a product with variants
+  const product = new Product({
+    title: 'Acme X100 Smartphone',
+    slug: 'acme-x100-smartphone',
+    description: 'A powerful smartphone with great battery life.',
+    shortDescription: 'Powerful + long battery',
+    categories: [{ _id: electronicsCat._id, name: 'Electronics', slug: 'electronics' }, { _id: smartphonesCat._id, name: 'Smartphones', slug: 'smartphones' }],
+    images: [ { url: 'https://example.com/x100-front.jpg', alt: 'Acme X100 front' }, { url: 'https://example.com/x100-back.jpg', alt: 'Acme X100 back' } ],
+    price: 199.99,
+    attributes: [ { key: 'brand', value: 'Acme' }, { key: 'series', value: 'X' } ],
+    variants: [
+      {
+        sku: 'ACME-X100-BLK-64',
+        title: 'Acme X100 - Black - 64GB',
+        price: 199.99,
+        compareAtPrice: 249.99,
+        attributes: [ { key: 'color', value: 'black' }, { key: 'storage', value: '64GB' } ],
+        images: [ { url: 'https://example.com/x100-black.jpg', alt: 'Black' } ],
+        inventory: { quantity: 50, warehouseLocation: 'WH-1' }
+      },
+      {
+        sku: 'ACME-X100-BLU-128',
+        title: 'Acme X100 - Blue - 128GB',
+        price: 229.99,
+        compareAtPrice: 279.99,
+        attributes: [ { key: 'color', value: 'blue' }, { key: 'storage', value: '128GB' } ],
+        images: [ { url: 'https://example.com/x100-blue.jpg', alt: 'Blue' } ],
+        inventory: { quantity: 20, warehouseLocation: 'WH-2' }
+      }
+    ],
+    reviews: [ { rating: 5, title: 'Great phone', body: 'Battery lasts two days!' }, { rating: 4, title: 'Very good', body: 'Camera could be better' } ]
+  });
+
+  await product.save();
+  console.log('Saved product with variants');
+
+  // ---------- Example queries ----------
+
+  // 1) Find product by slug
+  const p1 = await Product.findOne({ slug: 'acme-x100-smartphone' }).lean();
+  console.log('\nFind by slug:\n', { title: p1.title, variantsCount: p1.variants.length });
+
+  // 2) Find all products in a category using materialized path on Category
+  // Approach: find categories whose path startsWith '/electronics' then match product.categories._id in that set
+  const catsUnderElectronics = await Category.find({ path: { $regex: '^/electronics' } }, { _id: 1 }).lean();
+  const catIds = catsUnderElectronics.map(c => c._id);
+  const productsInElectronics = await Product.find({ 'categories._id': { $in: catIds } }, { title: 1, 'variants.sku': 1 }).lean();
+  console.log('\nProducts in /electronics and subcategories:\n', productsInElectronics.map(p => p.title));
+
+  // 3) Aggregation: Search variants under price limit (unwind variants)
+  const cheapVariants = await Product.aggregate([
+    { $unwind: '$variants' },
+    { $match: { 'variants.price': { $lt: 210 } } },
+    { $project: { title: 1, 'variants.sku': 1, 'variants.price': 1, 'variants.inventory.quantity': 1 } }
+  ]);
+  console.log('\nVariants priced < 210:\n', cheapVariants);
+
+  // 4) Text search (requires text index created above)
+  const textSearchResults = await Product.find({ $text: { $search: 'battery camera' } }, { score: { $meta: 'textScore' } }).sort({ score: { $meta: 'textScore' } }).lean();
+  console.log('\nText search results by relevance:\n', textSearchResults.map(r => ({ title: r.title })));
+
+  // 5) Update: Decrease inventory for a variant atomically
+  // Suppose we sell 2 units of the black 64GB SKU
+  const skuToDecrease = 'ACME-X100-BLK-64';
+  const decreaseBy = 2;
+  const res = await Product.findOneAndUpdate(
+    { 'variants.sku': skuToDecrease, 'variants.inventory.quantity': { $gte: decreaseBy } },
+    { $inc: { 'variants.$.inventory.quantity': -decreaseBy } },
+    { new: true }
+  ).lean();
+  if (res) console.log(`\nDecreased inventory for ${skuToDecrease}. New quantity:`, res.variants.find(v => v.sku === skuToDecrease).inventory.quantity);
+  else console.log('\nNot enough inventory or SKU not found');
+
+  // 6) Add an index recommendation (done in schema): text index on title+description, index on slug, index on categories path on Category
+
+  // 7) Aggregation: Get product-level stock summary (sum of variant quantities)
+  const stockSummary = await Product.aggregate([
+    { $match: { slug: 'acme-x100-smartphone' } },
+    { $unwind: '$variants' },
+    { $group: { _id: '$_id', title: { $first: '$title' }, totalStock: { $sum: '$variants.inventory.quantity' } } }
+  ]);
+  console.log('\nStock summary:\n', stockSummary);
+
+  // 8) Pagination example (products list)
+  const page = 1, perPage = 10;
+  const paged = await Product.find({ active: true }).skip((page-1)*perPage).limit(perPage).select('title slug price').lean();
+  console.log('\nPaged products:\n', paged.map(p => p.title));
+
+  // Close connection
+  await mongoose.disconnect();
+  console.log('\nDisconnected. Demo complete.\n');
+}
+
+main().catch(err => { console.error(err); process.exit(1); });
